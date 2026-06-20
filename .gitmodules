@@ -1,0 +1,3 @@
+[submodule "go-kafka-protocol"]
+	path = go-kafka-protocol
+	url = https://github.com/scholzj/go-kafka-protocol.git
