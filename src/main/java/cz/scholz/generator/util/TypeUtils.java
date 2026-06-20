@@ -32,6 +32,12 @@ public class TypeUtils {
                 return "int32";
             case "int64":
                 return "int64";
+            case "uint16":
+                return "uint16";
+            case "uint32":
+                return "uint32";
+            case "float64":
+                return "float64";
             case "bool":
                 return "bool";
             case "string":
@@ -80,6 +86,12 @@ public class TypeUtils {
                 return "WriteInt32";
             case "int64":
                 return "WriteInt64";
+            case "uint16":
+                return "WriteUint16";
+            case "uint32":
+                return "WriteUint32";
+            case "float64":
+                return "WriteFloat64";
             case "bool":
                 return "WriteBool";
             case "string":
@@ -127,6 +139,12 @@ public class TypeUtils {
                 return "ReadInt32";
             case "int64":
                 return "ReadInt64";
+            case "uint16":
+                return "ReadUInt16";
+            case "uint32":
+                return "ReadUInt32";
+            case "float64":
+                return "ReadFloat64";
             case "bool":
                 return "ReadBool";
             case "string":

@@ -1,6 +1,7 @@
 package cz.scholz.generator.model;
 
 import com.google.gson.annotations.SerializedName;
+import java.util.ArrayList;
 import java.util.List;
 
 public class Field {
@@ -121,6 +122,29 @@ public class Field {
 
     public void setFields(List<Field> fields) {
         this.fields = fields;
+    }
+
+    /** Deep copy, used to inline a shared commonStruct independently at each reference site. */
+    public Field copy() {
+        Field c = new Field();
+        c.name = name;
+        c.type = type;
+        c.versions = versions;
+        c.nullableVersions = nullableVersions;
+        c.taggedVersions = taggedVersions;
+        c.tag = tag;
+        c.about = about;
+        c.defaultValue = defaultValue;
+        c.ignorable = ignorable;
+        c.mapKey = mapKey;
+        c.entityType = entityType;
+        if (fields != null) {
+            c.fields = new ArrayList<>();
+            for (Field f : fields) {
+                c.fields.add(f.copy());
+            }
+        }
+        return c;
     }
 }
 

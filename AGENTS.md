@@ -11,9 +11,10 @@ for encoding (`Write`) and decoding (`Read`) Kafka requests and responses.
 The Go output is part of a separate Go module, `github.com/scholzj/go-kafka-protocol`,
 whose hand-written runtime (the `protocol` package) the generated code depends on.
 
-> ✅ **Status: working.** `mvn clean package` (from the repo root), then running the JAR against
-> `spec/` into the `go-kafka-protocol/` submodule, produces Go that builds, vets, and passes the
-> tests (`cd go-kafka-protocol && go build ./... && go vet ./... && go test ./...`).
+> ✅ **Status: working.** `mvn clean package` (from the repo root), then running the JAR (which reads
+> the Kafka message JSONs from the bundled kafka-clients JAR) into the `go-kafka-protocol/` submodule,
+> produces Go for **all ~178 requests/responses** that builds, vets, and passes the tests
+> (`cd go-kafka-protocol && go build ./... && go vet ./... && go test ./...`).
 > The generated output is then `gofmt`'d. See [Regenerating](#regenerating).
 >
 > The generator's intended output is the hand-written code in the upstream repo
@@ -31,28 +32,30 @@ The Java/Maven generator lives at the repo root; the generated Go code lives in 
 **`go-kafka-protocol` git submodule** (the real github.com/scholzj/go-kafka-protocol repo).
 
 ```
-pom.xml             Maven build (Gson 2.10.1, Java 11 source/target, assembly plugin)
+pom.xml             Maven build (Gson, kafka-clients ${kafka.version}, Java 11, assembly plugin)
 README.md           user-facing build/run instructions
 .gitignore          ignores /target/ and IDE files
 src/main/java/cz/scholz/generator/
-  Generator.java          main(); reads specs, drives generation, writes files
+  Generator.java          main(); reads message JSONs from the kafka-clients JAR, drives generation
   GoCodeGenerator.java    THE core — turns one ApiSpec into one .go file (~700 lines)
   GoTestGenerator.java    emits a round-trip <type>_test.go next to each message
   ApisGenerator.java      generates apis/apis.go (header-version lookup tables)
   model/
     ApiSpec.java          POJO for a spec file (apiKey, type, name, validVersions,
-                          flexibleVersions, fields)
-    Field.java            POJO for a field (name, type, versions, nullableVersions,
-                          taggedVersions, tag, about, ignorable, mapKey, ...)
+                          flexibleVersions, fields, commonStructs)
+    Field.java            POJO for a field (+ deep copy() for inlining commonStructs)
   util/
     TypeUtils.java        Kafka type -> Go type; protocol Read/Write method name;
                           package/struct/camelCase naming (incl. nestedStructName)
     VersionUtils.java     parse version strings ("0+", "3", "0-4") -> start/end ints
-    JsonCommentStripper.java  strips // and /* */ comments from the spec JSON
+    CommonStructResolver.java  inlines top-level commonStructs into the fields that reference them
+    JsonCommentStripper.java   strips // and /* */ comments from the spec JSON
 target/             Maven build output (gitignored; holds the runnable JAR)
 
-spec/               16 input JSON spec files (Kafka message definitions, with comments)
-                    e.g. ApiVersionsRequest.json, FetchResponse.json, MetadataRequest.json
+INPUT: the Kafka protocol message definitions are NOT vendored here — they are read straight from
+the kafka-clients JAR's resources (common/message/*.json). The Kafka version is the pom's
+`kafka.version` property. All requests and responses are generated (validVersions: "none" and the
+header/record "data" definitions are skipped).
 
 go-kafka-protocol/  GIT SUBMODULE -> github.com/scholzj/go-kafka-protocol (the OUTPUT target)
   go.mod            module github.com/scholzj/go-kafka-protocol + google/uuid; go 1.23.5
@@ -63,8 +66,8 @@ go-kafka-protocol/  GIT SUBMODULE -> github.com/scholzj/go-kafka-protocol (the O
     *_test.go
   apis/apis.go      GENERATED: RequestHeaderVersion / ResponseHeaderVersion lookup
   apis/apis_test.go HAND-WRITTEN: header-version table test
-  api/<name>/       GENERATED: one package per API, request.go and/or response.go
-                    e.g. api/apiversions/response.go -> package apiversions
+  api/<name>/       GENERATED: one package per API (~89 packages, all Kafka request/response),
+                    request.go and/or response.go, e.g. api/apiversions/response.go
                     GENERATED: request_test.go / response_test.go (round-trip tests)
                     HAND-WRITTEN extras: apiversions/wire_golden_test.go,
                     apiversions/tagged_fields_test.go, metadata/nullable_roundtrip_test.go
@@ -87,7 +90,8 @@ mvn clean package               # -> target/go-kafka-generator-1.0.0-jar-with-de
 
 ### Regenerating
 
-With no arguments the generator reads `spec/` and writes into the submodule:
+With no arguments the generator reads the Kafka message JSONs from the bundled kafka-clients JAR and
+writes into the submodule:
 
 ```bash
 java -jar target/go-kafka-generator-1.0.0-jar-with-dependencies.jar
@@ -99,10 +103,11 @@ gofmt -w go-kafka-protocol/api go-kafka-protocol/apis
 `{request,response}_test.go`) for each spec and `<outputDir>/../apis/apis.go` (note: `apis.go`
 lands in the *sibling* of `outputDir`). The generator emits tab-indented Go but does **not**
 align trailing comments or sort imports — `gofmt` does that, so always gofmt the output. The
-defaults baked into `Generator` are `spec` / `go-kafka-protocol/api`; override them with two
-positional args if needed.
+default output dir is `go-kafka-protocol/api`; override it with one positional arg. Per-message
+generation is isolated (a failing message is reported and skipped, not fatal); the run prints a
+`Generated N of M` summary.
 
-### Tests & coverage (~73% of statements)
+### Tests & coverage (~70% of statements over ~89 generated packages)
 
 Two layers, by design:
 - **Generated round-trip tests** (`GoTestGenerator` → `request_test.go`/`response_test.go`):
@@ -121,9 +126,10 @@ Two layers, by design:
 
 ## How generation works (the mental model)
 
-1. `Generator.main` lists `spec/*.json`, strips comments (`JsonCommentStripper`),
-   parses each with Gson into an `ApiSpec`, and skips specs whose `validVersions`
-   is `"none"`.
+1. `Generator.main` reads every `common/message/*.json` resource from the kafka-clients JAR, strips
+   comments (`JsonCommentStripper`), parses each with Gson into an `ApiSpec`, keeps only the
+   `request`/`response` types (skips `header`/`data` and `validVersions: "none"`), and inlines any
+   `commonStructs` (`CommonStructResolver`) so the rest of the generator sees plain inline structs.
 2. For every spec it constructs a `GoCodeGenerator` and calls `generate()`, which
    appends Go to an internal `StringBuilder` via `line(indent, text)` / `blank()`
    helpers. **All Go code is produced from plain string literals** — no template
@@ -160,12 +166,16 @@ its own tagged fields) → top-level `taggedFieldsEncoder`/`taggedFieldsDecoder`
   `type, err := …`).
 - **Go types** (`goType`): struct field → `*[]Nested` (array) or `*Nested` (single);
   otherwise `TypeUtils.toGoType` — `string` → `*string`, `records`/`bytes` → `*[]byte`,
-  `uuid` → `uuid.UUID`, ints/bool by value, primitive array → `*[]elem`.
+  `uuid` → `uuid.UUID`, `int8/16/32/64`, `uint16/32`, `float64`, `bool` by value, primitive
+  array → `*[]elem`. (Note the runtime's casing quirk: `WriteUint16` but `ReadUInt16`.)
+- **commonStructs**: resolved away before generation — `CommonStructResolver` deep-copies a
+  shared struct's fields into every field that references it, so each occurrence becomes an
+  ordinary inline nested struct (the path-derived naming then keeps every copy unique).
 - **Versions** (`versionCondition`): absolute — `>= N` when start>0, `<= M` when end is
   bounded, `== N` for a single version; no guard for `0+`. Guards are emitted even when
   `validVersions` starts above 0 (matches the reference).
 - **Flexible versions / tagged fields**: a spec is "flexible" when `flexibleVersions`
-  start `< MAX` (all 16 current specs are). Flexible versions use the *compact* encodings
+  start `< MAX` (most messages are; some old ones aren't). Flexible versions use the *compact* encodings
   and append a tagged-fields section. A field with a `tag` is written by the
   taggedFields encoder/decoder; a *nested* tagged field that also has regular versions is
   additionally written inline guarded by `if !isXFlexible(...)` (for the older
@@ -218,9 +228,10 @@ its own tagged fields) → top-level `taggedFieldsEncoder`/`taggedFieldsDecoder`
   encoding, receiver-based `ApiVersion`, `isResponseFlexible` in responses, `:=` instead of
   `var err error`, collision-proof method names, the de-duplicated `produce` decoder assignment,
   length-bounded tagged fields).
-- `spec/ApiVersionsResponse.json` is the best small worked example (arrays, nested
-  structs, tagged fields, flexible versions). `produce`/`fetch` exercise nested tagged
-  fields, single nested structs (`CurrentLeader`, `ReplicaState`), `records`, and `uuid`.
+- `ApiVersionsResponse` (in the kafka-clients JAR, or view upstream) is the best small worked
+  example (arrays, nested structs, tagged fields, flexible versions). `produce`/`fetch` exercise
+  nested tagged fields, single nested structs, `records`, and `uuid`; messages with `commonStructs`
+  (e.g. `OffsetCommit`, `JoinGroup`) exercise the inlining path.
 - Gotchas baked into the design: tagged fields only exist in flexible versions (always
   emitted with compact helpers); the decoder var name is the nested struct name fully
   lowercased; `string`/`bytes`/`records`/array all pick compact vs non-compact with a

@@ -1,17 +1,20 @@
 # Go Kafka Protocol Generator
 
-A Java-based code generator that reads Apache Kafka protocol JSON specifications and generates Go code
-for request and response types. The generated Go code is written into the
-[go-kafka-protocol](https://github.com/scholzj/go-kafka-protocol) repository, which is included here
-as a git submodule.
+A Java-based code generator that produces Go encode/decode code for **every Apache Kafka request and
+response**. The protocol message definitions are read directly from the `kafka-clients` JAR's bundled
+JSON resources (`common/message/*.json`), so there is no need to vendor the spec files. The generated
+Go code is written into the [go-kafka-protocol](https://github.com/scholzj/go-kafka-protocol)
+repository, which is included here as a git submodule.
 
 ## Layout
 
 ```
 pom.xml, src/        the Java/Maven generator (run from the repo root)
-spec/                Kafka protocol JSON specifications (the input)
 go-kafka-protocol/   git submodule -> github.com/scholzj/go-kafka-protocol (the output target)
 ```
+
+The Kafka version (and therefore the set of messages generated) is controlled by the
+`kafka.version` property in `pom.xml` (currently 4.3.0).
 
 ## Getting the submodule
 
@@ -27,24 +30,25 @@ git submodule update --init
 mvn clean package
 ```
 
-This creates a self-contained JAR in `target/go-kafka-generator-1.0.0-jar-with-dependencies.jar`.
+This creates a self-contained JAR in `target/go-kafka-generator-1.0.0-jar-with-dependencies.jar`
+(the Kafka message JSONs are bundled into it).
 
 ## Usage
 
-Run from the repository root. With no arguments it reads `spec/` and writes into the
-`go-kafka-protocol/` submodule:
+Run from the repository root. With no arguments it reads the message definitions from the bundled
+`kafka-clients` JAR and writes into the `go-kafka-protocol/` submodule:
 
 ```bash
 java -jar target/go-kafka-generator-1.0.0-jar-with-dependencies.jar
 gofmt -w go-kafka-protocol/api go-kafka-protocol/apis
 ```
 
-You can also pass the spec and output directories explicitly:
+An optional single argument overrides the output directory:
 
 ```bash
-java -jar target/go-kafka-generator-1.0.0-jar-with-dependencies.jar <spec-directory> <output-directory>
+java -jar target/go-kafka-generator-1.0.0-jar-with-dependencies.jar <output-directory>
 # or via Maven
-mvn exec:java -Dexec.mainClass="cz.scholz.generator.Generator" -Dexec.args="spec go-kafka-protocol/api"
+mvn exec:java -Dexec.mainClass="cz.scholz.generator.Generator" -Dexec.args="go-kafka-protocol/api"
 ```
 
 The generated code updates the submodule's working tree; review it there and commit/push it to the
@@ -52,9 +56,8 @@ go-kafka-protocol repository separately.
 
 ### Arguments
 
-- `spec-directory`: directory containing the JSON specification files (default: `spec`)
-- `output-directory`: directory for the generated `api/` packages (default: `go-kafka-protocol/api`;
-  `apis.go` is written to the sibling `apis/` directory)
+- `output-directory` (optional): directory for the generated `api/` packages (default:
+  `go-kafka-protocol/api`; `apis.go` is written to the sibling `apis/` directory)
 
 ## How It Works
 

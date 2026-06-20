@@ -3,133 +3,152 @@ package cz.scholz.generator;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import cz.scholz.generator.model.ApiSpec;
+import cz.scholz.generator.util.CommonStructResolver;
 import cz.scholz.generator.util.JsonCommentStripper;
 import cz.scholz.generator.util.TypeUtils;
 
-import java.io.File;
-import java.io.IOException;
+import java.io.InputStream;
+import java.net.JarURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Enumeration;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
 
+/**
+ * Entry point. Reads the Apache Kafka protocol message definitions straight out of the
+ * {@code kafka-clients} JAR (resources under {@code common/message/*.json}) and generates Go code for
+ * every request and response into the go-kafka-protocol submodule.
+ */
 public class Generator {
-    // Defaults assume the generator is run from the repository root. The output goes into the
-    // go-kafka-protocol git submodule; apis.go lands in its sibling "apis" directory.
-    private static final String SPEC_DIR = "spec";
+    // Default output directory (the go-kafka-protocol submodule's api/ folder). apis.go is written to
+    // its sibling apis/ directory. Override with a single command-line argument.
     private static final String OUTPUT_DIR = "go-kafka-protocol/api";
 
+    // Where the Kafka message definitions live inside the kafka-clients JAR.
+    private static final String MESSAGE_RESOURCE_DIR = "common/message/";
+
     public static void main(String[] args) {
-        String specDir = args.length > 0 ? args[0] : SPEC_DIR;
-        String outputDir = args.length > 1 ? args[1] : OUTPUT_DIR;
+        String outputDir = args.length > 0 ? args[0] : OUTPUT_DIR;
 
         try {
-            File specDirectory = new File(specDir);
-            if (!specDirectory.exists() || !specDirectory.isDirectory()) {
-                System.err.println("Spec directory does not exist: " + specDir);
-                System.exit(1);
-            }
-
-            File[] jsonFiles = specDirectory.listFiles((dir, name) -> name.endsWith(".json"));
-            if (jsonFiles == null || jsonFiles.length == 0) {
-                System.err.println("No JSON files found in: " + specDir);
-                System.exit(1);
-            }
+            Map<String, String> messageJsons = loadMessageJsons();
+            System.out.println("Found " + messageJsons.size() + " Kafka message definitions on the classpath.");
 
             Gson gson = new GsonBuilder().setLenient().create();
-            List<ApiSpec> allSpecs = new ArrayList<>();
+            List<ApiSpec> specs = new ArrayList<>();
+            List<String> skipped = new ArrayList<>();
 
-            for (File jsonFile : jsonFiles) {
-                System.out.println("Processing: " + jsonFile.getName());
-                
+            // Parse, keep only requests/responses, and inline any commonStructs.
+            for (Map.Entry<String, String> entry : new TreeMap<>(messageJsons).entrySet()) {
                 try {
-                    String jsonContent = new String(Files.readAllBytes(jsonFile.toPath()));
-                    String cleanedJson = JsonCommentStripper.stripComments(jsonContent);
-                    
-                    ApiSpec spec = gson.fromJson(cleanedJson, ApiSpec.class);
-
-                    if (!"none".equals(spec.getValidVersions())) {
-                        allSpecs.add(spec);
+                    String cleaned = JsonCommentStripper.stripComments(entry.getValue());
+                    ApiSpec spec = gson.fromJson(cleaned, ApiSpec.class);
+                    if (spec == null || spec.getType() == null || spec.getName() == null) {
+                        continue;
                     }
-                    
-                    //GoCodeGenerator generator = new GoCodeGenerator(spec);
-                    //String goCode = generator.generate();
-                    //
-                    //// Determine output directory based on package name
-                    //String packageName = getPackageName(spec.getName());
-                    //Path outputPath = Paths.get(outputDir, packageName);
-                    //Files.createDirectories(outputPath);
-                    //
-                    //// Determine file name (request.go or response.go)
-                    //String fileName = spec.getType() + ".go";
-                    //Path outputFile = outputPath.resolve(fileName);
-                    //
-                    //Files.write(outputFile, goCode.getBytes());
-                    //System.out.println("Generated: " + outputFile);
-                    
+                    if (!"request".equals(spec.getType()) && !"response".equals(spec.getType())) {
+                        continue; // skip header / record (data) definitions
+                    }
+                    if ("none".equals(spec.getValidVersions())) {
+                        continue; // deprecated / unsupported message
+                    }
+                    CommonStructResolver.resolve(spec);
+                    specs.add(spec);
                 } catch (Exception e) {
-                    System.err.println("Error processing " + jsonFile.getName() + ": " + e.getMessage());
-                    e.printStackTrace();
+                    skipped.add(entry.getKey() + " (parse: " + e.getMessage() + ")");
                 }
             }
 
-            // Generate request / response code
-            try {
-                for (ApiSpec spec : allSpecs) {
-                    GoCodeGenerator generator = new GoCodeGenerator(spec);
-                    String goCode = generator.generate();
-
-                    // Determine output directory based on package name
-                    String packageName = TypeUtils.toPackageName(spec.getName());
-                    Path outputPath = Paths.get(outputDir, packageName);
-                    Files.createDirectories(outputPath);
-
-                    // Determine file name (request.go or response.go)
-                    String fileName = spec.getType() + ".go";
-                    Path outputFile = outputPath.resolve(fileName);
-
-                    Files.write(outputFile, goCode.getBytes());
-                    System.out.println("Generated: " + outputFile);
-
-                    // Generate a round-trip test alongside the message (request_test.go / response_test.go)
+            // Generate the Go code and round-trip test for each message. Failures are isolated so one
+            // unsupported message cannot abort the whole run.
+            int generated = 0;
+            for (ApiSpec spec : specs) {
+                try {
+                    String goCode = new GoCodeGenerator(spec).generate();
                     String testCode = new GoTestGenerator(spec).generate();
-                    Path testFile = outputPath.resolve(spec.getType() + "_test.go");
-                    Files.write(testFile, testCode.getBytes());
-                    System.out.println("Generated: " + testFile);
+
+                    Path packageDir = Paths.get(outputDir, TypeUtils.toPackageName(spec.getName()));
+                    Files.createDirectories(packageDir);
+                    Files.write(packageDir.resolve(spec.getType() + ".go"), goCode.getBytes(StandardCharsets.UTF_8));
+                    Files.write(packageDir.resolve(spec.getType() + "_test.go"), testCode.getBytes(StandardCharsets.UTF_8));
+                    generated++;
+                } catch (Exception e) {
+                    skipped.add(spec.getName() + " (generate: " + e.getMessage() + ")");
                 }
-            } catch (Exception e) {
-                System.err.println("Error generating api package: " + e.getMessage());
-                e.printStackTrace();
             }
 
-            // TODO: Valid versions support
-
-            // Generate apis.go file
+            // Generate the apis.go header-version lookup tables from all parsed specs.
             try {
-                ApisGenerator apisGenerator = new ApisGenerator(allSpecs);
-                String apisCode = apisGenerator.generate();
-                
-                // Determine output directory for apis.go (should be in go/apis directory)
-                // Assuming outputDir is ../go/api, apis.go should be in ../go/apis
-                Path apisOutputDir = Paths.get(outputDir).getParent().resolve("apis");
-                Files.createDirectories(apisOutputDir);
-                Path apisOutputFile = apisOutputDir.resolve("apis.go");
-                
-                Files.write(apisOutputFile, apisCode.getBytes());
-                System.out.println("Generated: " + apisOutputFile);
+                String apisCode = new ApisGenerator(specs).generate();
+                Path apisDir = Paths.get(outputDir).getParent().resolve("apis");
+                Files.createDirectories(apisDir);
+                Files.write(apisDir.resolve("apis.go"), apisCode.getBytes(StandardCharsets.UTF_8));
             } catch (Exception e) {
                 System.err.println("Error generating apis.go: " + e.getMessage());
                 e.printStackTrace();
             }
-            
-            System.out.println("Generation complete!");
-            
+
+            System.out.println("Generated " + generated + " of " + specs.size() + " message files into " + outputDir);
+            if (!skipped.isEmpty()) {
+                System.out.println("Skipped " + skipped.size() + ":");
+                skipped.forEach(s -> System.out.println("  - " + s));
+            }
         } catch (Exception e) {
             System.err.println("Error: " + e.getMessage());
             e.printStackTrace();
             System.exit(1);
         }
     }
-}
 
+    /** Reads every {@code common/message/*.json} resource from the kafka-clients JAR on the classpath. */
+    private static Map<String, String> loadMessageJsons() throws Exception {
+        ClassLoader cl = Generator.class.getClassLoader();
+        // Use a stable, always-present message as an anchor to locate the JAR (or directory).
+        URL anchor = cl.getResource(MESSAGE_RESOURCE_DIR + "ApiVersionsRequest.json");
+        if (anchor == null) {
+            throw new IllegalStateException(
+                    "Kafka message definitions not found on the classpath - is the kafka-clients dependency present?");
+        }
+
+        Map<String, String> jsons = new TreeMap<>();
+        if ("jar".equals(anchor.getProtocol())) {
+            JarURLConnection connection = (JarURLConnection) anchor.openConnection();
+            Path jarPath = Paths.get(connection.getJarFileURL().toURI());
+            try (JarFile jar = new JarFile(jarPath.toFile())) {
+                Enumeration<JarEntry> entries = jar.entries();
+                while (entries.hasMoreElements()) {
+                    JarEntry e = entries.nextElement();
+                    String name = e.getName();
+                    if (name.startsWith(MESSAGE_RESOURCE_DIR) && name.endsWith(".json")) {
+                        try (InputStream in = jar.getInputStream(e)) {
+                            jsons.put(fileName(name), new String(in.readAllBytes(), StandardCharsets.UTF_8));
+                        }
+                    }
+                }
+            }
+        } else {
+            // Resources on disk (e.g. an exploded classpath): list the containing directory.
+            Path dir = Paths.get(anchor.toURI()).getParent();
+            try (var paths = Files.list(dir)) {
+                for (Path p : (Iterable<Path>) paths::iterator) {
+                    if (p.getFileName().toString().endsWith(".json")) {
+                        jsons.put(p.getFileName().toString(), Files.readString(p));
+                    }
+                }
+            }
+        }
+        return jsons;
+    }
+
+    private static String fileName(String resourcePath) {
+        return resourcePath.substring(resourcePath.lastIndexOf('/') + 1);
+    }
+}

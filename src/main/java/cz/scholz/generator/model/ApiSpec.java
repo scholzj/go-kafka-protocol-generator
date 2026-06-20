@@ -19,8 +19,15 @@ public class ApiSpec {
     private List<String> listeners;
     private List<Field> fields;
 
+    @SerializedName("commonStructs")
+    private List<Field> commonStructs;
+
     public Integer getApiKey() {
         return apiKey;
+    }
+
+    public List<Field> getCommonStructs() {
+        return commonStructs;
     }
 
     public void setApiKey(Integer apiKey) {
