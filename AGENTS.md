@@ -95,13 +95,15 @@ writes into the submodule:
 
 ```bash
 java -jar target/go-kafka-generator-1.0.0-jar-with-dependencies.jar
-gofmt -w go-kafka-protocol/api go-kafka-protocol/apis
+gofmt -w go-kafka-protocol/api go-kafka-protocol/apis go-kafka-protocol/messages
 (cd go-kafka-protocol && go build ./... && go vet ./... && go test ./...)
 ```
 
 `Generator` writes `<outputDir>/<package>/{request,response}.go` (plus a matching
-`{request,response}_test.go`) for each spec and `<outputDir>/../apis/apis.go` (note: `apis.go`
-lands in the *sibling* of `outputDir`). The generator emits tab-indented Go but does **not**
+`{request,response}_test.go`) for each spec, `<outputDir>/../apis/apis.go` (header-version lookup
+tables), and `<outputDir>/../messages/messages.go` (the api-key → body-struct registry, plus
+`Name`/`VersionRange`/named key constants — note: both `apis.go` and `messages.go` land in
+*siblings* of `outputDir`). The generator emits tab-indented Go but does **not**
 align trailing comments or sort imports — `gofmt` does that, so always gofmt the output. The
 default output dir is `go-kafka-protocol/api`; override it with one positional arg. Per-message
 generation is isolated (a failing message is reported and skipped, not fatal); the run prints a

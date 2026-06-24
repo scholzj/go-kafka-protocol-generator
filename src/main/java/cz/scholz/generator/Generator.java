@@ -96,6 +96,18 @@ public class Generator {
                 e.printStackTrace();
             }
 
+            // Generate the messages.go registry (api key -> body struct, names, version ranges) from
+            // all parsed specs. Lives in its own leaf package to avoid an import cycle with protocol.
+            try {
+                String messagesCode = new MessagesGenerator(specs).generate();
+                Path messagesDir = Paths.get(outputDir).getParent().resolve("messages");
+                Files.createDirectories(messagesDir);
+                Files.write(messagesDir.resolve("messages.go"), messagesCode.getBytes(StandardCharsets.UTF_8));
+            } catch (Exception e) {
+                System.err.println("Error generating messages.go: " + e.getMessage());
+                e.printStackTrace();
+            }
+
             System.out.println("Generated " + generated + " of " + specs.size() + " message files into " + outputDir);
             if (!skipped.isEmpty()) {
                 System.out.println("Skipped " + skipped.size() + ":");

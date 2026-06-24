@@ -40,7 +40,7 @@ Run from the repository root. With no arguments it reads the message definitions
 
 ```bash
 java -jar target/go-kafka-generator-1.0.0-jar-with-dependencies.jar
-gofmt -w go-kafka-protocol/api go-kafka-protocol/apis
+gofmt -w go-kafka-protocol/api go-kafka-protocol/apis go-kafka-protocol/messages
 ```
 
 An optional single argument overrides the output directory:
