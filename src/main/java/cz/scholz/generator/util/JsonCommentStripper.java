@@ -12,47 +12,55 @@ public class JsonCommentStripper {
         StringWriter writer = new StringWriter();
         String line;
         boolean inString = false;
-        
+        // Tracked across lines so a /* ... */ block spanning multiple lines is stripped correctly.
+        boolean inBlockComment = false;
+
         while ((line = reader.readLine()) != null) {
             StringBuilder cleaned = new StringBuilder();
             char[] chars = line.toCharArray();
-            
+
             for (int i = 0; i < chars.length; i++) {
                 char c = chars[i];
-                
-                if (c == '"' && (i == 0 || chars[i - 1] != '\\')) {
-                    inString = !inString;
-                    cleaned.append(c);
-                } else if (!inString && c == '/' && i + 1 < chars.length) {
-                    if (chars[i + 1] == '/') {
-                        // Single line comment - skip rest of line
-                        break;
-                    } else if (chars[i + 1] == '*') {
-                        // Multi-line comment start - skip until */
+
+                if (inBlockComment) {
+                    // Skip everything until the closing */ (which may be on a later line).
+                    if (c == '*' && i + 1 < chars.length && chars[i + 1] == '/') {
                         i++;
-                        while (i + 1 < chars.length) {
-                            if (chars[i] == '*' && chars[i + 1] == '/') {
-                                i++;
-                                break;
-                            }
-                            i++;
-                        }
-                        continue;
-                    } else {
-                        cleaned.append(c);
+                        inBlockComment = false;
                     }
+                    continue;
+                }
+
+                if (inString) {
+                    cleaned.append(c);
+                    if (c == '"' && (i == 0 || chars[i - 1] != '\\')) {
+                        inString = false;
+                    }
+                    continue;
+                }
+
+                if (c == '"') {
+                    inString = true;
+                    cleaned.append(c);
+                } else if (c == '/' && i + 1 < chars.length && chars[i + 1] == '/') {
+                    // Single line comment - skip rest of line
+                    break;
+                } else if (c == '/' && i + 1 < chars.length && chars[i + 1] == '*') {
+                    // Block comment start - skip until the matching */ (possibly on a later line).
+                    inBlockComment = true;
+                    i++;
                 } else {
                     cleaned.append(c);
                 }
             }
-            
+
             String cleanedLine = cleaned.toString().trim();
             if (!cleanedLine.isEmpty()) {
                 writer.write(cleanedLine);
                 writer.write('\n');
             }
         }
-        
+
         return writer.toString();
     }
 }

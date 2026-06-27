@@ -17,6 +17,8 @@ public class Field {
     
     private Integer tag;
     private String about;
+
+    @SerializedName("default")
     private String defaultValue;
     private Boolean ignorable;
     

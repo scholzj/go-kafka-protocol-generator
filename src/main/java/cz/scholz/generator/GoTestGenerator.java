@@ -64,38 +64,28 @@ public class GoTestGenerator {
         line(0, "func " + ptrHelper + "[T any](v T) *T { return &v }");
         blank();
 
-        String param = paramType.toLowerCase();
+        boolean nullsVariant = hasAlwaysNullableField(spec.getFields());
+
         line(0, "// Round-trips a fully populated " + mainStruct + " through Write/Read/Write at every");
         line(0, "// valid protocol version and checks the re-encoded bytes match.");
         line(0, "func Test" + mainStruct + "RoundTrip(t *testing.T) {");
-        line(1, "in := &" + structLiteral(mainStruct, spec.getFields()));
+        line(1, "in := &" + structLiteral(mainStruct, spec.getFields(), false));
+        if (nullsVariant) {
+            blank();
+            line(1, "// A second instance with every always-nullable field set to nil. The fully-populated");
+            line(1, "// instance never encodes a null, so this is what actually exercises the null-marker");
+            line(1, "// write/read paths (nullable single structs, nullable arrays, nullable strings/bytes).");
+            line(1, "inNulls := &" + structLiteral(mainStruct, spec.getFields(), true));
+        }
         blank();
         line(1, "for v := int16(" + minVersion + "); v <= " + maxVersion + "; v++ {");
-        line(2, "in.ApiVersion = v");
+        emitRoundTrip("in", nullsVariant ? "populated" : null, 2);
+        if (nullsVariant) {
+            blank();
+            emitRoundTrip("inNulls", "nulls", 2);
+        }
         blank();
-        line(2, "var buf bytes.Buffer");
-        line(2, "if err := in.Write(&buf); err != nil {");
-        line(3, "t.Fatalf(\"v%d: write: %v\", v, err)");
-        line(2, "}");
-        line(2, "encoded := buf.Bytes()");
-        blank();
-        line(2, "out := &" + mainStruct + "{}");
-        line(2, param + " := &protocol." + paramType + "{Body: bytes.NewBuffer(encoded)}");
-        line(2, param + ".ApiVersion = v");
-        line(2, "if err := out.Read(" + param + "); err != nil {");
-        line(3, "t.Fatalf(\"v%d: read: %v\", v, err)");
-        line(2, "}");
-        blank();
-        line(2, "var reencoded bytes.Buffer");
-        line(2, "if err := out.Write(&reencoded); err != nil {");
-        line(3, "t.Fatalf(\"v%d: re-write: %v\", v, err)");
-        line(2, "}");
-        line(2, "if !bytes.Equal(encoded, reencoded.Bytes()) {");
-        line(3, "t.Errorf(\"v%d: round-trip mismatch:\\n  encoded:   %x\\n  reencoded: %x\", v, encoded, reencoded.Bytes())");
-        line(2, "}");
-        blank();
-        line(2, "// PrettyPrint must not panic, for the populated and the zero value alike.");
-        line(2, "_ = in.PrettyPrint()");
+        line(2, "// PrettyPrint must not panic on the zero value either.");
         line(2, "_ = (&" + mainStruct + "{}).PrettyPrint()");
         line(1, "}");
         line(0, "}");
@@ -103,36 +93,81 @@ public class GoTestGenerator {
         return sb.toString();
     }
 
+    /**
+     * Emits one self-contained Write/Read/Write round-trip block for the given input variable. The
+     * body is wrapped in its own block so the local variables (buf, out, …) do not collide when more
+     * than one round-trip is emitted in the same loop. {@code label}, when non-null, distinguishes the
+     * variant in failure messages.
+     */
+    private void emitRoundTrip(String inVar, String label, int indent) {
+        String param = paramType.toLowerCase();
+        String tag = label == null ? "" : " " + label;
+        line(indent, "{");
+        int b = indent + 1;
+        line(b, inVar + ".ApiVersion = v");
+        blank();
+        line(b, "var buf bytes.Buffer");
+        line(b, "if err := " + inVar + ".Write(&buf); err != nil {");
+        line(b + 1, "t.Fatalf(\"v%d:" + tag + " write: %v\", v, err)");
+        line(b, "}");
+        line(b, "encoded := buf.Bytes()");
+        blank();
+        line(b, "out := &" + mainStruct + "{}");
+        line(b, param + " := &protocol." + paramType + "{Body: bytes.NewBuffer(encoded)}");
+        line(b, param + ".ApiVersion = v");
+        line(b, "if err := out.Read(" + param + "); err != nil {");
+        line(b + 1, "t.Fatalf(\"v%d:" + tag + " read: %v\", v, err)");
+        line(b, "}");
+        blank();
+        line(b, "var reencoded bytes.Buffer");
+        line(b, "if err := out.Write(&reencoded); err != nil {");
+        line(b + 1, "t.Fatalf(\"v%d:" + tag + " re-write: %v\", v, err)");
+        line(b, "}");
+        line(b, "if !bytes.Equal(encoded, reencoded.Bytes()) {");
+        line(b + 1, "t.Errorf(\"v%d:" + tag + " round-trip mismatch:\\n  encoded:   %x\\n  reencoded: %x\", v, encoded, reencoded.Bytes())");
+        line(b, "}");
+        blank();
+        line(b, "_ = " + inVar + ".PrettyPrint()");
+        line(indent, "}");
+    }
+
     ////////////////////////////////////////////////////////////////////////////
     // Value builders
     ////////////////////////////////////////////////////////////////////////////
 
-    /** A composite literal for a struct: {@code StructName{Field: value, ...}} (gofmt re-indents). */
-    private String structLiteral(String structName, List<Field> fields) {
+    /** A composite literal for a struct: {@code StructName{Field: value, ...}} (gofmt re-indents).
+     *  When {@code nulls} is set, every always-nullable field (at any depth) is emitted as nil. */
+    private String structLiteral(String structName, List<Field> fields, boolean nulls) {
         StringBuilder lit = new StringBuilder(structName).append("{\n");
         for (Field field : fields) {
             lit.append("\t").append(TypeUtils.toCamelCase(field.getName()))
-               .append(": ").append(fieldValue(structName, field)).append(",\n");
+               .append(": ").append(fieldValue(structName, field, nulls)).append(",\n");
         }
         lit.append("}");
         return lit.toString();
     }
 
-    /** A valid value expression for a single field. */
-    private String fieldValue(String parentStruct, Field field) {
+    /** A valid value expression for a single field. In {@code nulls} mode an always-nullable field
+     *  becomes {@code nil}; everything else stays populated (recursing the nulls mode into nested
+     *  structs so their always-nullable sub-fields are nil too). */
+    private String fieldValue(String parentStruct, Field field, boolean nulls) {
         String type = field.getType();
+
+        if (nulls && isAlwaysNullable(field)) {
+            return "nil";
+        }
 
         if (TypeUtils.isArrayType(type)) {
             String elem = TypeUtils.getArrayElementType(type);
             if (hasFields(field)) {
                 String nested = TypeUtils.nestedStructName(parentStruct, field);
-                return "&[]" + nested + "{" + structLiteral(nested, field.getFields()) + "}";
+                return "&[]" + nested + "{" + structLiteral(nested, field.getFields(), nulls) + "}";
             }
             return "&[]" + elementGoType(elem) + "{" + scalarLiteral(elem) + "}";
         }
         if (hasFields(field)) {
             String nested = TypeUtils.nestedStructName(parentStruct, field);
-            return "&" + structLiteral(nested, field.getFields());
+            return "&" + structLiteral(nested, field.getFields(), nulls);
         }
         switch (type) {
             case "string":
@@ -143,6 +178,33 @@ public class GoTestGenerator {
             default:
                 return scalarLiteral(type);
         }
+    }
+
+    /** A field that is nullable across its entire presence range - safe to set nil at any version in
+     *  the message's valid range (where the field is absent it is simply not written). */
+    private boolean isAlwaysNullable(Field field) {
+        if (field.getNullableVersions() == null) {
+            return false;
+        }
+        int pStart = VersionUtils.getStartVersion(field.getVersions());
+        int pEnd = VersionUtils.getEndVersion(field.getVersions());
+        int nStart = VersionUtils.getStartVersion(field.getNullableVersions());
+        int nEnd = VersionUtils.getEndVersion(field.getNullableVersions());
+        return nStart <= pStart && pEnd <= nEnd;
+    }
+
+    /** Whether any field (at any depth) is always-nullable, i.e. whether a nil-variant instance would
+     *  differ from the fully-populated one and is worth round-tripping. */
+    private boolean hasAlwaysNullableField(List<Field> fields) {
+        for (Field field : fields) {
+            if (isAlwaysNullable(field)) {
+                return true;
+            }
+            if (hasFields(field) && hasAlwaysNullableField(field.getFields())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** A literal for a value-typed scalar (also used as an array element). */
@@ -178,20 +240,23 @@ public class GoTestGenerator {
     // Versions
     ////////////////////////////////////////////////////////////////////////////
 
-    /** The highest version worth exercising: the highest version referenced anywhere in the spec,
-     *  capped at the end of {@code validVersions}. */
+    /** The highest version worth exercising. When {@code validVersions} has a finite end, that end is
+     *  the top of the supported range and every version up to it must be tested (a field/flexible
+     *  reference may stop earlier, e.g. ApiVersionsResponse references up to v3 but is valid 0-4).
+     *  Only when {@code validVersions} is open-ended do we fall back to the highest referenced version,
+     *  since we cannot loop to infinity. */
     private int computeMaxVersion() {
+        int validEnd = VersionUtils.getEndVersion(spec.getValidVersions());
+        if (validEnd != NO_END) {
+            return validEnd;
+        }
+
         int max = minVersion;
         int flexStart = VersionUtils.getStartVersion(spec.getFlexibleVersions());
         if (flexStart != NO_END) {
             max = Math.max(max, flexStart);
         }
         max = Math.max(max, maxFieldVersion(spec.getFields()));
-
-        int validEnd = VersionUtils.getEndVersion(spec.getValidVersions());
-        if (validEnd != NO_END) {
-            max = Math.min(max, validEnd);
-        }
         return max;
     }
 

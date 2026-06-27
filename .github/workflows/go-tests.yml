@@ -1,0 +1,54 @@
+name: Go tests
+
+# Builds the Java generator, regenerates the Go code into the go-kafka-protocol submodule, then
+# builds, vets and tests it. This validates the generator's current output end to end (the generated
+# code is exercised against the hand-written protocol runtime in the submodule).
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  go-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository (with submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go-kafka-protocol/go.mod
+
+      - name: Build the generator
+        run: mvn -B -ntp clean package
+
+      - name: Generate the Go code
+        run: java -jar target/*-jar-with-dependencies.jar
+
+      - name: Format the generated Go code
+        run: gofmt -w go-kafka-protocol/api go-kafka-protocol/apis go-kafka-protocol/messages
+
+      - name: Build
+        working-directory: go-kafka-protocol
+        run: go build ./...
+
+      - name: Vet
+        working-directory: go-kafka-protocol
+        run: go vet ./...
+
+      - name: Test
+        working-directory: go-kafka-protocol
+        run: go test ./...

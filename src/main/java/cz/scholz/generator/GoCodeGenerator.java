@@ -288,9 +288,7 @@ public class GoCodeGenerator {
             writeArray(ref, elemEncoderCompact, elemEncoderPlain, field.getNullableVersions() != null, indent);
         } else if (hasFields(field)) {
             // Single nested struct - always a pointer, written through its encoder.
-            line(indent, "if err := " + receiver + "." + methodName(field, "Encoder") + "(w, *" + ref + "); err != nil {");
-            line(indent + 1, "return err");
-            line(indent, "}");
+            writeSingleStruct(field, ref, indent);
         } else if (type.equals("string")) {
             writeLengthPrefixed(field, ref, indent, "String");
         } else if (type.equals("bytes")) {
@@ -329,6 +327,43 @@ public class GoCodeGenerator {
         } else {
             writeSimple(plain, indent);
         }
+    }
+
+    /**
+     * Emits the write for a single nested struct. A nullable struct is preceded by an int8 marker
+     * ({@code -1} for null, {@code 1} for present) exactly as Kafka encodes it; a non-nullable struct
+     * (or a non-nullable version of a partially-nullable one) is written inline - {@link #emitNullCheck}
+     * has already rejected a nil pointer in those versions.
+     */
+    private void writeSingleStruct(Field field, String ref, int indent) {
+        String encoder = receiver + "." + methodName(field, "Encoder");
+        String nullableCond = nullableVersionCondition(field);
+        if (nullableCond == null) {
+            writeStructEncode(encoder, ref, indent);
+        } else if (nullableCond.isEmpty()) {
+            writeNullableStructBody(encoder, ref, indent);
+        } else {
+            line(indent, "if " + nullableCond + " {");
+            writeNullableStructBody(encoder, ref, indent + 1);
+            line(indent, "} else {");
+            writeStructEncode(encoder, ref, indent + 1);
+            line(indent, "}");
+        }
+    }
+
+    private void writeNullableStructBody(String encoder, String ref, int indent) {
+        line(indent, "if " + ref + " == nil {");
+        writeSimple("protocol.WriteInt8(w, -1)", indent + 1);
+        line(indent, "} else {");
+        writeSimple("protocol.WriteInt8(w, 1)", indent + 1);
+        writeStructEncode(encoder, ref, indent + 1);
+        line(indent, "}");
+    }
+
+    private void writeStructEncode(String encoder, String ref, int indent) {
+        line(indent, "if err := " + encoder + "(w, *" + ref + "); err != nil {");
+        line(indent + 1, "return err");
+        line(indent, "}");
     }
 
     /**
@@ -417,6 +452,45 @@ public class GoCodeGenerator {
         return parts.size() == 1 ? parts.get(0) : "(" + String.join(" || ", parts) + ")";
     }
 
+    /**
+     * Returns the version predicate (using the receiver's ApiVersion) selecting the versions in which
+     * a field is nullable - i.e. where a nullable single struct needs its int8 null marker, or where
+     * an array must use the nullable (null-accepting) reader rather than the strict one:
+     * <ul>
+     *   <li>{@code null} - the field is never nullable in any version it is present;</li>
+     *   <li>{@code ""}   - nullable in every version it is present;</li>
+     *   <li>a Go boolean expression - nullable only in the versions it matches.</li>
+     * </ul>
+     * This is the complement of {@link #nonNullableVersionPredicate}.
+     */
+    private String nullableVersionCondition(Field field) {
+        if (field.getNullableVersions() == null) {
+            return null;
+        }
+
+        int pStart = VersionUtils.getStartVersion(field.getVersions());
+        int pEnd = VersionUtils.getEndVersion(field.getVersions());
+        int nStart = VersionUtils.getStartVersion(field.getNullableVersions());
+        int nEnd = VersionUtils.getEndVersion(field.getNullableVersions());
+
+        if (nStart <= pStart && pEnd <= nEnd) {
+            return ""; // nullable everywhere the field exists
+        }
+        if (pEnd < nStart || pStart > nEnd) {
+            return null; // the nullable range never overlaps the field's versions
+        }
+
+        // Partial overlap: nullable only inside the intersection of the two ranges.
+        List<String> parts = new ArrayList<>();
+        if (nStart > pStart) {
+            parts.add(receiver + ".ApiVersion >= " + nStart);
+        }
+        if (nEnd < pEnd) {
+            parts.add(receiver + ".ApiVersion <= " + nEnd);
+        }
+        return parts.size() == 1 ? parts.get(0) : "(" + String.join(" && ", parts) + ")";
+    }
+
     ////////////////////////////////////////////////////////////////////////////
     // Read
     ////////////////////////////////////////////////////////////////////////////
@@ -429,9 +503,18 @@ public class GoCodeGenerator {
         line(2, "return fmt.Errorf(\"" + mainStruct + ".Read: " + param + " or its body is nil\")");
         line(1, "}");
         blank();
+        // Reset the receiver so a reused struct does not keep stale values: positional fields are
+        // always overwritten, but a tagged field whose tag is absent (or a field absent at this
+        // version) would otherwise retain whatever a previous Read left behind, including
+        // rawTaggedFields. Starting from the zero value also gives every tagged field its Kafka
+        // default (the explicit non-zero ones are then re-applied below).
+        line(1, "*" + receiver + " = " + mainStruct + "{}");
+        blank();
         line(1, "r := bytes.NewBuffer(" + param + ".Body.Bytes())");
         line(1, receiver + ".ApiVersion = " + param + ".ApiVersion");
         blank();
+
+        emitDefaultInits(spec.getFields(), receiver, mainStruct, 1);
 
         boolean hasTagged = false;
         for (Field field : spec.getFields()) {
@@ -510,33 +593,18 @@ public class GoCodeGenerator {
                 decoderCompact = "protocol." + TypeUtils.getProtocolReadMethod(elem, false, true, false);
                 decoderPlain = "protocol." + TypeUtils.getProtocolReadMethod(elem, false, false, false);
             }
-            readArray(var, dst, decoderCompact, decoderPlain, field.getNullableVersions() != null, errReturn, indent);
+            readArray(var, dst, decoderCompact, decoderPlain, nullableVersionCondition(field), errReturn, indent);
         } else if (hasFields(field)) {
             // Single nested struct.
-            line(indent, var + ", err := " + receiver + "." + methodName(field, "Decoder") + "(r)");
-            readErrCheck(errReturn, indent);
-            line(indent, dst + " = &" + var);
+            readSingleStruct(field, var, dst, errReturn, indent);
         } else if (type.equals("string")) {
             readLengthPrefixed(field, var, dst, errReturn, indent, "String");
         } else if (type.equals("bytes")) {
             readLengthPrefixed(field, var, dst, errReturn, indent, "Bytes");
         } else if (type.equals("records")) {
-            // Records use the compact length only in flexible versions (decided at runtime).
-            if (flexible) {
-                line(indent, "if " + flexibleCheck() + " {");
-                line(indent + 1, var + ", err := protocol.ReadCompactRecords(r)");
-                readErrCheck(errReturn, indent + 1);
-                line(indent + 1, dst + " = " + var);
-                line(indent, "} else {");
-                line(indent + 1, var + ", err := protocol.ReadRecords(r)");
-                readErrCheck(errReturn, indent + 1);
-                line(indent + 1, dst + " = " + var);
-                line(indent, "}");
-            } else {
-                line(indent, var + ", err := protocol.ReadRecords(r)");
-                readErrCheck(errReturn, indent);
-                line(indent, dst + " = " + var); // records read returns *[]byte
-            }
+            // Records use the compact length only in flexible versions (decided at runtime); the
+            // nullable vs strict (null-rejecting) reader is chosen per version like strings/arrays.
+            readRecords(field, var, dst, errReturn, indent);
         } else {
             String method = TypeUtils.getProtocolReadMethod(type, false, false, false);
             line(indent, var + ", err := protocol." + method + "(r)");
@@ -545,51 +613,190 @@ public class GoCodeGenerator {
         }
     }
 
-    private void readArray(String var, String dst, String decoderCompact, String decoderPlain, boolean nullable, String errReturn, int indent) {
-        if (flexible) {
-            line(indent, "if " + flexibleCheck() + " {");
-            line(indent + 1, var + ", err := protocol.ReadNullableCompactArray(r, " + decoderCompact + ")");
-            readErrCheck(errReturn, indent + 1);
-            line(indent + 1, dst + " = " + var); // ReadNullableCompactArray returns *[]T
-            line(indent, "} else {");
-            readPlainArray(var, dst, decoderPlain, nullable, errReturn, indent + 1);
-            line(indent, "}");
+    /**
+     * Reads a single nested struct, mirroring {@link #writeSingleStruct}. A nullable struct is
+     * preceded by an int8 marker ({@code < 0} means null); a non-nullable struct is decoded inline.
+     */
+    private void readSingleStruct(Field field, String var, String dst, String errReturn, int indent) {
+        String decoder = receiver + "." + methodName(field, "Decoder");
+        String nullableCond = nullableVersionCondition(field);
+        if (nullableCond == null) {
+            readStructDecode(decoder, var, dst, errReturn, indent);
+        } else if (nullableCond.isEmpty()) {
+            readNullableStructBody(decoder, var, dst, errReturn, indent);
         } else {
-            readPlainArray(var, dst, decoderPlain, nullable, errReturn, indent);
+            line(indent, "if " + nullableCond + " {");
+            readNullableStructBody(decoder, var, dst, errReturn, indent + 1);
+            line(indent, "} else {");
+            readStructDecode(decoder, var, dst, errReturn, indent + 1);
+            line(indent, "}");
         }
     }
 
-    private void readPlainArray(String var, String dst, String decoderPlain, boolean nullable, String errReturn, int indent) {
-        // ReadNullableArray returns *[]T (assignable directly); ReadArray returns []T (we address it).
-        String reader = nullable ? "ReadNullableArray" : "ReadArray";
-        line(indent, var + ", err := protocol." + reader + "(r, " + decoderPlain + ")");
+    private void readNullableStructBody(String decoder, String var, String dst, String errReturn, int indent) {
+        line(indent, var + "Flag, err := protocol.ReadInt8(r)");
         readErrCheck(errReturn, indent);
-        line(indent, nullable ? dst + " = " + var : dst + " = &" + var);
+        line(indent, "if " + var + "Flag >= 0 {");
+        readStructDecode(decoder, var, dst, errReturn, indent + 1);
+        line(indent, "} else {");
+        line(indent + 1, dst + " = nil");
+        line(indent, "}");
     }
 
-    /** Reads a length-prefixed pointer type ({@code word} is "String" or "Bytes"), mirroring
-     *  {@link #writeLengthPrefixed}. */
-    private void readLengthPrefixed(Field field, String var, String dst, String errReturn, int indent, String word) {
-        boolean nullable = field.getNullableVersions() != null;
-        // Nullable reads return a pointer already; non-nullable reads return a value we address.
-        String assign = nullable ? dst + " = " + var : dst + " = &" + var;
-        String compact = (nullable ? "ReadNullableCompact" : "ReadCompact") + word;
-        String plain = (nullable ? "ReadNullable" : "Read") + word;
+    private void readStructDecode(String decoder, String var, String dst, String errReturn, int indent) {
+        line(indent, var + ", err := " + decoder + "(r)");
+        readErrCheck(errReturn, indent);
+        line(indent, dst + " = &" + var);
+    }
+
+    /**
+     * Reads an array, choosing the nullable or the strict (null-rejecting) reader per version.
+     * {@code nullableCond} is the {@link #nullableVersionCondition} for the field: {@code null} means
+     * never nullable (always strict), {@code ""} means nullable across its whole range (always
+     * nullable), and a Go expression means partial - nullable only in the matching versions, strict
+     * elsewhere, so a wire null is rejected exactly in the versions where the field is non-nullable.
+     */
+    private void readArray(String var, String dst, String decoderCompact, String decoderPlain, String nullableCond, String errReturn, int indent) {
         if (flexible) {
             line(indent, "if " + flexibleCheck() + " {");
-            line(indent + 1, var + ", err := protocol." + compact + "(r)");
-            readErrCheck(errReturn, indent + 1);
-            line(indent + 1, assign);
+            readArrayChoice(var, dst, decoderCompact, nullableCond, errReturn, indent + 1, true);
             line(indent, "} else {");
-            line(indent + 1, var + ", err := protocol." + plain + "(r)");
-            readErrCheck(errReturn, indent + 1);
-            line(indent + 1, assign);
+            readArrayChoice(var, dst, decoderPlain, nullableCond, errReturn, indent + 1, false);
             line(indent, "}");
         } else {
-            line(indent, var + ", err := protocol." + plain + "(r)");
-            readErrCheck(errReturn, indent);
-            line(indent, assign);
+            readArrayChoice(var, dst, decoderPlain, nullableCond, errReturn, indent, false);
         }
+    }
+
+    /** Emits the nullable/strict array read for one encoding (compact or plain), version-split when the
+     *  field is only partially nullable. */
+    private void readArrayChoice(String var, String dst, String decoder, String nullableCond, String errReturn, int indent, boolean compact) {
+        if (nullableCond == null) {
+            readArrayStrict(var, dst, decoder, errReturn, indent, compact);
+        } else if (nullableCond.isEmpty()) {
+            readArrayNullable(var, dst, decoder, errReturn, indent, compact);
+        } else {
+            line(indent, "if " + nullableCond + " {");
+            readArrayNullable(var, dst, decoder, errReturn, indent + 1, compact);
+            line(indent, "} else {");
+            readArrayStrict(var, dst, decoder, errReturn, indent + 1, compact);
+            line(indent, "}");
+        }
+    }
+
+    /** Nullable array read: the helper returns {@code *[]T}, assignable directly. */
+    private void readArrayNullable(String var, String dst, String decoder, String errReturn, int indent, boolean compact) {
+        String reader = compact ? "ReadNullableCompactArray" : "ReadNullableArray";
+        line(indent, var + ", err := protocol." + reader + "(r, " + decoder + ")");
+        readErrCheck(errReturn, indent);
+        line(indent, dst + " = " + var);
+    }
+
+    /** Strict (null-rejecting) array read: the helper returns {@code []T}, which we address. */
+    private void readArrayStrict(String var, String dst, String decoder, String errReturn, int indent, boolean compact) {
+        String reader = compact ? "ReadCompactArray" : "ReadArray";
+        line(indent, var + ", err := protocol." + reader + "(r, " + decoder + ")");
+        readErrCheck(errReturn, indent);
+        line(indent, dst + " = &" + var);
+    }
+
+    /**
+     * Reads a length-prefixed pointer type ({@code word} is "String" or "Bytes"), choosing the
+     * nullable or the strict (null-rejecting) reader per version - mirroring {@link #readArray}.
+     * {@code nullableCond} is the {@link #nullableVersionCondition}: {@code null} = always strict,
+     * {@code ""} = always nullable, a Go expression = nullable only in the matching versions (so a
+     * wire null is rejected exactly in the versions where the field is non-nullable).
+     */
+    private void readLengthPrefixed(Field field, String var, String dst, String errReturn, int indent, String word) {
+        String nullableCond = nullableVersionCondition(field);
+        if (flexible) {
+            line(indent, "if " + flexibleCheck() + " {");
+            readLengthPrefixedChoice(var, dst, word, nullableCond, errReturn, indent + 1, true);
+            line(indent, "} else {");
+            readLengthPrefixedChoice(var, dst, word, nullableCond, errReturn, indent + 1, false);
+            line(indent, "}");
+        } else {
+            readLengthPrefixedChoice(var, dst, word, nullableCond, errReturn, indent, false);
+        }
+    }
+
+    private void readLengthPrefixedChoice(String var, String dst, String word, String nullableCond, String errReturn, int indent, boolean compact) {
+        if (nullableCond == null) {
+            readLengthPrefixedStrict(var, dst, word, errReturn, indent, compact);
+        } else if (nullableCond.isEmpty()) {
+            readLengthPrefixedNullable(var, dst, word, errReturn, indent, compact);
+        } else {
+            line(indent, "if " + nullableCond + " {");
+            readLengthPrefixedNullable(var, dst, word, errReturn, indent + 1, compact);
+            line(indent, "} else {");
+            readLengthPrefixedStrict(var, dst, word, errReturn, indent + 1, compact);
+            line(indent, "}");
+        }
+    }
+
+    /** Nullable string/bytes read: the helper returns a pointer, assignable directly. */
+    private void readLengthPrefixedNullable(String var, String dst, String word, String errReturn, int indent, boolean compact) {
+        String reader = (compact ? "ReadNullableCompact" : "ReadNullable") + word;
+        line(indent, var + ", err := protocol." + reader + "(r)");
+        readErrCheck(errReturn, indent);
+        line(indent, dst + " = " + var);
+    }
+
+    /** Strict (null-rejecting) string/bytes read: the helper returns a value, which we address. */
+    private void readLengthPrefixedStrict(String var, String dst, String word, String errReturn, int indent, boolean compact) {
+        String reader = (compact ? "ReadCompact" : "Read") + word;
+        line(indent, var + ", err := protocol." + reader + "(r)");
+        readErrCheck(errReturn, indent);
+        line(indent, dst + " = &" + var);
+    }
+
+    /**
+     * Reads a records field, choosing the compact encoding in flexible versions and the nullable vs
+     * strict (null-rejecting) reader per version - mirroring {@link #readLengthPrefixed}. Records are
+     * length-prefixed like bytes; the nullable helpers return {@code *[]byte}, the strict ones
+     * {@code []byte}.
+     */
+    private void readRecords(Field field, String var, String dst, String errReturn, int indent) {
+        String nullableCond = nullableVersionCondition(field);
+        if (flexible) {
+            line(indent, "if " + flexibleCheck() + " {");
+            readRecordsChoice(var, dst, nullableCond, errReturn, indent + 1, true);
+            line(indent, "} else {");
+            readRecordsChoice(var, dst, nullableCond, errReturn, indent + 1, false);
+            line(indent, "}");
+        } else {
+            readRecordsChoice(var, dst, nullableCond, errReturn, indent, false);
+        }
+    }
+
+    private void readRecordsChoice(String var, String dst, String nullableCond, String errReturn, int indent, boolean compact) {
+        if (nullableCond == null) {
+            readRecordsStrict(var, dst, errReturn, indent, compact);
+        } else if (nullableCond.isEmpty()) {
+            readRecordsNullable(var, dst, errReturn, indent, compact);
+        } else {
+            line(indent, "if " + nullableCond + " {");
+            readRecordsNullable(var, dst, errReturn, indent + 1, compact);
+            line(indent, "} else {");
+            readRecordsStrict(var, dst, errReturn, indent + 1, compact);
+            line(indent, "}");
+        }
+    }
+
+    /** Nullable records read: the helper returns {@code *[]byte}, assignable directly. */
+    private void readRecordsNullable(String var, String dst, String errReturn, int indent, boolean compact) {
+        String reader = compact ? "ReadCompactRecords" : "ReadRecords";
+        line(indent, var + ", err := protocol." + reader + "(r)");
+        readErrCheck(errReturn, indent);
+        line(indent, dst + " = " + var);
+    }
+
+    /** Strict (null-rejecting) records read: the helper returns {@code []byte}, which we address. */
+    private void readRecordsStrict(String var, String dst, String errReturn, int indent, boolean compact) {
+        String reader = compact ? "ReadCompactRecordsStrict" : "ReadRecordsStrict";
+        line(indent, var + ", err := protocol." + reader + "(r)");
+        readErrCheck(errReturn, indent);
+        line(indent, dst + " = &" + var);
     }
 
     private void readErrCheck(String errReturn, int indent) {
@@ -648,6 +855,7 @@ public class GoCodeGenerator {
         line(0, "func (" + receiver + " *" + mainStruct + ") " + methodName(field, "Decoder") + "(r io.Reader) (" + nested + ", error) {");
         line(1, var + " := " + nested + "{}");
         blank();
+        emitDefaultInits(field.getFields(), var, nested, 1);
         String errReturn = "return " + var + ", err";
         for (Field sub : field.getFields()) {
             emitNestedFieldRead(sub, nested, var, errReturn);
@@ -715,35 +923,243 @@ public class GoCodeGenerator {
     private void emitTaggedFieldWrite(Field field, String accessor) {
         String ref = accessor + "." + capitalize(field.getName());
         line(1, "// Tag " + field.getTag());
-        if (isPointerType(field)) {
-            // Pointer-typed tagged fields are only serialised when present.
-            line(1, "if " + ref + " != nil {");
-            line(2, "buf = bytes.NewBuffer(make([]byte, 0))");
-            emitTaggedValueWrite(field, ref, 2);
-            blank();
-            line(2, "taggedFields = append(taggedFields, protocol.TaggedField{Tag: " + field.getTag() + ", Field: buf.Bytes()})");
+
+        // A tagged field is serialised only when the ApiVersion is within its taggedVersions range
+        // AND its value differs from the default (Kafka omits a tag whose value equals the default,
+        // and a pointer/nullable tag whose value is nil). Both conditions are combined into one guard.
+        List<String> conds = new ArrayList<>();
+        String verCond = versionCondition(taggedFieldVersions(field));
+        if (verCond != null) {
+            conds.add(verCond);
+        }
+        String valCond = taggedEmitValueCondition(field, ref);
+        if (valCond != null) {
+            conds.add(valCond);
+        }
+
+        int indent = 1;
+        if (!conds.isEmpty()) {
+            line(1, "if " + String.join(" && ", conds) + " {");
+            indent = 2;
+        }
+        line(indent, "buf = bytes.NewBuffer(make([]byte, 0))");
+        emitTaggedValueWrite(field, ref, indent);
+        blank();
+        line(indent, "taggedFields = append(taggedFields, protocol.TaggedField{Tag: " + field.getTag() + ", Field: buf.Bytes()})");
+        if (!conds.isEmpty()) {
             line(1, "}");
-        } else {
-            line(1, "buf = bytes.NewBuffer(make([]byte, 0))");
-            emitTaggedValueWrite(field, ref, 1);
-            blank();
-            line(1, "taggedFields = append(taggedFields, protocol.TaggedField{Tag: " + field.getTag() + ", Field: buf.Bytes()})");
         }
         blank();
+    }
+
+    /**
+     * Emits, at the top of a Read/Decoder, the initialisation of every field whose Kafka default is
+     * not already the Go zero value the receiver reset provides. A field absent from the wire (a tag
+     * that is not present, or a positional field outside its version range) keeps its default:
+     * <ul>
+     *   <li>value fields with a non-zero default (e.g. {@code -1} or a bool {@code true}) are set to it;</li>
+     *   <li>non-nullable <b>tagged</b> array fields default to an empty list (Kafka's collection
+     *       default) rather than nil;</li>
+     *   <li>non-nullable <b>tagged</b> scalar-only struct fields default to a struct with its
+     *       sub-field defaults, matching the instance Kafka materialises for an omitted tag.</li>
+     * </ul>
+     * Nullable fields default to nil (already provided by the reset).
+     */
+    private void emitDefaultInits(List<Field> fields, String target, String parentStruct, int indent) {
+        List<String> inits = new ArrayList<>();
+        for (Field f : fields) {
+            String lit = defaultInitLiteral(parentStruct, f);
+            if (lit != null) {
+                inits.add(target + "." + capitalize(f.getName()) + " = " + lit);
+            }
+        }
+        if (inits.isEmpty()) {
+            return;
+        }
+        line(indent, "// Field defaults (applied before decode; a field absent from the wire keeps its default)");
+        for (String s : inits) {
+            line(indent, s);
+        }
+        blank();
+    }
+
+    /**
+     * The Go literal a field must be initialised to before decode so that, if it is absent from the
+     * wire, it carries its Kafka default - or {@code null} when the default is the Go zero value the
+     * receiver reset already gives it (a zero-default value, or a nil pointer/nullable field).
+     */
+    private String defaultInitLiteral(String parentStruct, Field field) {
+        if (!isPointerType(field)) {
+            return nonZeroDefaultLiteral(field);
+        }
+        // Only non-nullable tagged pointer fields have a non-nil Kafka default worth materialising; a
+        // nullable field defaults to null (nil), and a non-tagged field is read whenever it is present.
+        if (field.getTag() == null || field.getNullableVersions() != null) {
+            return null;
+        }
+        if (TypeUtils.isArrayType(field.getType())) {
+            return "&" + goType(parentStruct, field).substring(1) + "{}"; // *[]T -> &[]T{}
+        }
+        if (hasFields(field) && allScalarSubfields(field)) {
+            String nested = goType(parentStruct, field).substring(1); // *Nested -> Nested
+            List<String> subInits = new ArrayList<>();
+            for (Field sub : field.getFields()) {
+                String d = nonZeroDefaultLiteral(sub);
+                if (d != null) {
+                    subInits.add(capitalize(sub.getName()) + ": " + d);
+                }
+            }
+            return "&" + nested + "{" + String.join(", ", subInits) + "}";
+        }
+        return null; // tagged string/bytes/records (and non-scalar structs): leave nil
+    }
+
+    /** The Go literal for a value-typed field's non-zero Kafka default, or {@code null} when the
+     *  default is the type's zero value (so no explicit initialisation is needed). */
+    private String nonZeroDefaultLiteral(Field field) {
+        String type = field.getType();
+        String def = field.getDefaultValue();
+        switch (type) {
+            case "bool":
+                return "true".equalsIgnoreCase(def) ? "true" : null;
+            case "uuid":
+                return null; // zero uuid default
+            default: // int8 / int16 / int32 / int64
+                if (def != null && !def.isEmpty() && !def.equals("0")) {
+                    return def;
+                }
+                return null;
+        }
+    }
+
+    /** The versions in which a tagged field is serialised as a tag: its {@code taggedVersions} if the
+     *  spec gives one, otherwise its {@code versions}. */
+    private String taggedFieldVersions(Field field) {
+        return field.getTaggedVersions() != null ? field.getTaggedVersions() : field.getVersions();
+    }
+
+    /**
+     * The Go condition under which a tagged field's value must be serialised (it differs from the
+     * Kafka default Kafka would otherwise omit), or {@code null} when there is no value-based guard:
+     * <ul>
+     *   <li>a <b>non-nullable array</b> - the default is an empty array, so emit only when non-nil
+     *       <em>and</em> non-empty;</li>
+     *   <li>a <b>nullable array</b> - the default is null, so nil and empty are distinct: emit
+     *       whenever non-nil (an empty-but-present array still differs from null);</li>
+     *   <li>a <b>single struct</b> whose sub-fields are all scalars - the default is the struct with
+     *       every sub-field at its default, so emit when non-nil and at least one sub-field differs;
+     *       a struct with non-scalar sub-fields falls back to non-nil (its default is not modelled);</li>
+     *   <li>other <b>pointer/nullable</b> tags (string, bytes, records) - emit when non-nil;</li>
+     *   <li>a <b>value</b> tag - emit when it differs from its default (see {@link #valueDiffersFromDefault}).</li>
+     * </ul>
+     */
+    private String taggedEmitValueCondition(Field field, String ref) {
+        if (TypeUtils.isArrayType(field.getType())) {
+            if (field.getNullableVersions() != null) {
+                return ref + " != nil"; // nullable: null is the default, empty differs from it
+            }
+            return ref + " != nil && len(*" + ref + ") > 0"; // non-nullable: empty is the default
+        }
+        if (hasFields(field)) {
+            // Single nested struct: model its default (all sub-fields at their defaults) when every
+            // sub-field is a scalar value type; otherwise just guard on non-nil. Even a struct whose
+            // scalar fields are all at their defaults must still be emitted when it carries preserved
+            // raw (unknown nested) tagged fields, otherwise those would be dropped on re-encode.
+            String structDiff = structDiffersFromDefault(field, ref);
+            if (structDiff != null) {
+                return ref + " != nil && (" + structDiff
+                        + " || (" + ref + ".rawTaggedFields != nil && len(*" + ref + ".rawTaggedFields) > 0))";
+            }
+            return ref + " != nil";
+        }
+        if (isPointerType(field)) {
+            return ref + " != nil";
+        }
+        return valueDiffersFromDefault(field, ref);
+    }
+
+    /** The Go condition that a value-typed field differs from its Kafka default (an explicit
+     *  {@code default} or, failing that, the type's zero value: {@code false} for bool, the zero uuid,
+     *  {@code 0} for an int). */
+    private String valueDiffersFromDefault(Field field, String ref) {
+        String type = field.getType();
+        String def = field.getDefaultValue();
+        switch (type) {
+            case "bool":
+                return "true".equalsIgnoreCase(def) ? "!" + ref : ref;
+            case "uuid":
+                // The literal is parenthesised so the composite-literal braces are not misparsed.
+                return ref + " != (uuid.UUID{})";
+            default: // int8 / int16 / int32 / int64
+                String d = (def != null && !def.isEmpty()) ? def : "0";
+                return ref + " != " + d;
+        }
+    }
+
+    /**
+     * The Go condition that a single nested struct differs from its all-defaults value, i.e. an OR of
+     * each sub-field differing from its default - or {@code null} when the struct has a non-scalar
+     * sub-field (whose default is not modelled) or no sub-fields. Kafka omits a tagged struct that
+     * equals a freshly-defaulted instance; this reproduces that test for the common scalar-only case.
+     */
+    private String structDiffersFromDefault(Field field, String ref) {
+        if (!allScalarSubfields(field)) {
+            return null; // a non-scalar (or tagged) sub-field: do not model the struct default
+        }
+        List<String> parts = new ArrayList<>();
+        for (Field sub : field.getFields()) {
+            parts.add(valueDiffersFromDefault(sub, ref + "." + capitalize(sub.getName())));
+        }
+        return String.join(" || ", parts);
+    }
+
+    /** Whether a struct field has at least one sub-field and every sub-field is a plain scalar value
+     *  type (no tag, not a pointer/nullable, not itself a struct) - the case whose default we model. */
+    private boolean allScalarSubfields(Field field) {
+        if (field.getFields() == null || field.getFields().isEmpty()) {
+            return false;
+        }
+        for (Field sub : field.getFields()) {
+            if (sub.getTag() != null || isPointerType(sub) || hasFields(sub)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** Writes one tagged field into {@code buf}. Tagged fields only exist in flexible versions, so
      *  the compact encodings are always used. */
     private void emitTaggedValueWrite(Field field, String ref, int indent) {
         String type = field.getType();
+
+        // A single nested struct that is nullable is preceded by Kafka's int8 null marker even when
+        // serialised as a tag. A tag is only emitted when its value is present (the surrounding guard
+        // is `ref != nil`), so the marker is always 1 here, followed by the struct.
+        if (!TypeUtils.isArrayType(type) && hasFields(field)) {
+            String encoder = receiver + "." + methodName(field, "Encoder");
+            String nullableCond = nullableVersionCondition(field);
+            if (nullableCond == null) {
+                writeTaggedStmt(encoder + "(buf, *" + ref + ")", indent); // non-nullable: no marker
+            } else if (nullableCond.isEmpty()) {
+                writeTaggedStmt("protocol.WriteInt8(buf, 1)", indent);
+                writeTaggedStmt(encoder + "(buf, *" + ref + ")", indent);
+            } else {
+                // A tagged single struct whose nullability varies by version is not produced by any
+                // current Kafka spec; the in-tag encoding would need verifying against the broker, so
+                // fail loudly (this message is reported and skipped) rather than emit wrong bytes.
+                throw new UnsupportedOperationException(
+                        "tagged single nested struct '" + field.getName()
+                        + "' with version-dependent nullability is not supported");
+            }
+            return;
+        }
+
         String call;
         if (TypeUtils.isArrayType(type)) {
             String encoder = hasFields(field)
                     ? receiver + "." + methodName(field, "Encoder")
                     : "protocol." + TypeUtils.getProtocolWriteMethod(TypeUtils.getArrayElementType(type), false, true, false);
             call = "protocol.WriteNullableCompactArray(buf, " + encoder + ", " + ref + ")";
-        } else if (hasFields(field)) {
-            call = receiver + "." + methodName(field, "Encoder") + "(buf, *" + ref + ")";
         } else if (type.equals("string") || type.equals("bytes")) {
             String word = type.equals("string") ? "String" : "Bytes";
             boolean nullable = field.getNullableVersions() != null;
@@ -755,6 +1171,12 @@ public class GoCodeGenerator {
         } else {
             call = "protocol." + TypeUtils.getProtocolWriteMethod(type, false, true, false) + "(buf, " + ref + ")";
         }
+        writeTaggedStmt(call, indent);
+    }
+
+    /** Emits {@code if err := <call>; err != nil { return taggedFields, err }} inside a tagged-fields
+     *  encoder (where the error path must return the accumulated taggedFields slice). */
+    private void writeTaggedStmt(String call, int indent) {
         line(indent, "if err := " + call + "; err != nil {");
         line(indent + 1, "return taggedFields, err");
         line(indent, "}");
@@ -777,61 +1199,113 @@ public class GoCodeGenerator {
     }
 
     private void emitTaggedFieldsDecoderBody(List<Field> tagged, String accessor) {
-        line(1, "rawTaggedFields := make([]protocol.TaggedField, 0)");
+        // This decoder is called once per tag by ReadTaggedFields. A tag is "known" only when its
+        // number matches a generated case AND the ApiVersion is within that field's taggedVersions
+        // range; anything else (a genuinely unknown tag, or a known tag number seen in a version where
+        // the field does not exist) is preserved verbatim in rawTaggedFields so it round-trips instead
+        // of being decoded into a field and then silently dropped on re-encode. Unknown tags are
+        // accumulated into the struct's existing slice rather than a fresh one that would be reassigned
+        // (and lost) on every call.
+        line(1, "known := false");
         blank();
         line(1, "switch tag {");
         for (Field field : tagged) {
             emitTaggedFieldRead(field, accessor);
         }
-        line(1, "default:");
-        line(2, "// Unknown tag - keep the raw bytes (r is bounded to this tag's length by ReadTaggedFields)");
+        line(1, "}");
+        blank();
+        line(1, "if !known {");
+        line(2, "// Keep the raw bytes (r is bounded to this tag's length by ReadTaggedFields)");
         line(2, "field, err := io.ReadAll(r)");
         line(2, "if err != nil {");
         line(3, "return err");
         line(2, "}");
-        line(2, "rawTaggedFields = append(rawTaggedFields, protocol.TaggedField{Tag: tag, Field: field})");
+        line(2, "if " + accessor + ".rawTaggedFields == nil {");
+        line(3, "rawTaggedFields := make([]protocol.TaggedField, 0)");
+        line(3, accessor + ".rawTaggedFields = &rawTaggedFields");
+        line(2, "}");
+        line(2, "*" + accessor + ".rawTaggedFields = append(*" + accessor + ".rawTaggedFields, protocol.TaggedField{Tag: tag, Field: field})");
         line(1, "}");
-        blank();
-        line(1, "// Set the raw tagged fields");
-        line(1, accessor + ".rawTaggedFields = &rawTaggedFields");
         blank();
         line(1, "return nil");
     }
 
     private void emitTaggedFieldRead(Field field, String accessor) {
+        line(1, "case " + field.getTag() + ":");
+        line(2, "// " + capitalize(field.getName()));
+        // Decode only when the ApiVersion is within the field's taggedVersions range; otherwise leave
+        // `known` false so the post-switch handler preserves the bytes as a raw tag.
+        String verCond = versionCondition(taggedFieldVersions(field));
+        if (verCond != null) {
+            line(2, "if " + verCond + " {");
+            line(3, "known = true");
+            emitTaggedFieldReadValue(field, accessor, 3);
+            line(2, "}");
+        } else {
+            line(2, "known = true");
+            emitTaggedFieldReadValue(field, accessor, 2);
+        }
+    }
+
+    /** Emits the decode statements for one tagged field at base indent {@code bi}. */
+    private void emitTaggedFieldReadValue(Field field, String accessor, int bi) {
         String type = field.getType();
         String var = safeVar(field.getName());
         String dst = accessor + "." + capitalize(field.getName());
-        line(1, "case " + field.getTag() + ":");
-        line(2, "// " + capitalize(field.getName()));
 
         if (TypeUtils.isArrayType(type)) {
             String decoder = hasFields(field)
                     ? receiver + "." + methodName(field, "Decoder")
                     : "protocol." + TypeUtils.getProtocolReadMethod(TypeUtils.getArrayElementType(type), false, true, false);
-            line(2, var + ", err := protocol.ReadNullableCompactArray(r, " + decoder + ")");
-            readErrCheck("return err", 2);
-            line(2, dst + " = " + var);
+            if (field.getNullableVersions() != null) {
+                line(bi, var + ", err := protocol.ReadNullableCompactArray(r, " + decoder + ")");
+                readErrCheck("return err", bi);
+                line(bi, dst + " = " + var); // *[]T
+            } else {
+                // Non-nullable tag: reject a wire null (length 0) instead of decoding it to nil.
+                line(bi, var + ", err := protocol.ReadCompactArray(r, " + decoder + ")");
+                readErrCheck("return err", bi);
+                line(bi, dst + " = &" + var); // []T
+            }
         } else if (hasFields(field)) {
-            line(2, var + "Val, err := " + receiver + "." + methodName(field, "Decoder") + "(r)");
-            readErrCheck("return err", 2);
-            line(2, dst + " = &" + var + "Val");
+            String decoder = receiver + "." + methodName(field, "Decoder");
+            String nullableCond = nullableVersionCondition(field);
+            if (nullableCond == null) {
+                line(bi, var + "Val, err := " + decoder + "(r)");
+                readErrCheck("return err", bi);
+                line(bi, dst + " = &" + var + "Val");
+            } else if (nullableCond.isEmpty()) {
+                // Nullable struct tag: read the int8 marker first (mirrors emitTaggedValueWrite).
+                line(bi, var + "Flag, err := protocol.ReadInt8(r)");
+                readErrCheck("return err", bi);
+                line(bi, "if " + var + "Flag >= 0 {");
+                line(bi + 1, var + "Val, err := " + decoder + "(r)");
+                readErrCheck("return err", bi + 1);
+                line(bi + 1, dst + " = &" + var + "Val");
+                line(bi, "} else {");
+                line(bi + 1, dst + " = nil");
+                line(bi, "}");
+            } else {
+                throw new UnsupportedOperationException(
+                        "tagged single nested struct '" + field.getName()
+                        + "' with version-dependent nullability is not supported");
+            }
         } else if (type.equals("string") || type.equals("bytes")) {
             String word = type.equals("string") ? "String" : "Bytes";
             boolean nullable = field.getNullableVersions() != null;
             String method = (nullable ? "ReadNullableCompact" : "ReadCompact") + word;
-            line(2, var + ", err := protocol." + method + "(r)");
-            readErrCheck("return err", 2);
-            line(2, nullable ? dst + " = " + var : dst + " = &" + var);
+            line(bi, var + ", err := protocol." + method + "(r)");
+            readErrCheck("return err", bi);
+            line(bi, nullable ? dst + " = " + var : dst + " = &" + var);
         } else if (type.equals("records")) {
-            line(2, var + ", err := protocol.ReadCompactRecords(r)");
-            readErrCheck("return err", 2);
-            line(2, dst + " = " + var);
+            line(bi, var + ", err := protocol.ReadCompactRecords(r)");
+            readErrCheck("return err", bi);
+            line(bi, dst + " = " + var);
         } else {
             String method = TypeUtils.getProtocolReadMethod(type, false, true, false);
-            line(2, var + ", err := protocol." + method + "(r)");
-            readErrCheck("return err", 2);
-            line(2, dst + " = " + var);
+            line(bi, var + ", err := protocol." + method + "(r)");
+            readErrCheck("return err", bi);
+            line(bi, dst + " = " + var);
         }
     }
 

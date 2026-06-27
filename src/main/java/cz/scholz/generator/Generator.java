@@ -69,7 +69,9 @@ public class Generator {
 
             // Generate the Go code and round-trip test for each message. Failures are isolated so one
             // unsupported message cannot abort the whole run.
-            int generated = 0;
+            // Only specs whose Go code was written successfully may be referenced by the registries;
+            // otherwise messages.go could import a package that was never generated.
+            List<ApiSpec> generatedSpecs = new ArrayList<>();
             for (ApiSpec spec : specs) {
                 try {
                     String goCode = new GoCodeGenerator(spec).generate();
@@ -79,15 +81,16 @@ public class Generator {
                     Files.createDirectories(packageDir);
                     Files.write(packageDir.resolve(spec.getType() + ".go"), goCode.getBytes(StandardCharsets.UTF_8));
                     Files.write(packageDir.resolve(spec.getType() + "_test.go"), testCode.getBytes(StandardCharsets.UTF_8));
-                    generated++;
+                    generatedSpecs.add(spec);
                 } catch (Exception e) {
                     skipped.add(spec.getName() + " (generate: " + e.getMessage() + ")");
                 }
             }
+            int generated = generatedSpecs.size();
 
-            // Generate the apis.go header-version lookup tables from all parsed specs.
+            // Generate the apis.go header-version lookup tables from the successfully generated specs.
             try {
-                String apisCode = new ApisGenerator(specs).generate();
+                String apisCode = new ApisGenerator(generatedSpecs).generate();
                 Path apisDir = Paths.get(outputDir).getParent().resolve("apis");
                 Files.createDirectories(apisDir);
                 Files.write(apisDir.resolve("apis.go"), apisCode.getBytes(StandardCharsets.UTF_8));
@@ -99,7 +102,7 @@ public class Generator {
             // Generate the messages.go registry (api key -> body struct, names, version ranges) from
             // all parsed specs. Lives in its own leaf package to avoid an import cycle with protocol.
             try {
-                String messagesCode = new MessagesGenerator(specs).generate();
+                String messagesCode = new MessagesGenerator(generatedSpecs).generate();
                 Path messagesDir = Paths.get(outputDir).getParent().resolve("messages");
                 Files.createDirectories(messagesDir);
                 Files.write(messagesDir.resolve("messages.go"), messagesCode.getBytes(StandardCharsets.UTF_8));
